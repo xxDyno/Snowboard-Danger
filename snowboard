@@ -1,0 +1,312 @@
+-- ╔════════════════════════════════════════════════════════════╗
+-- ║      Snowboard Gravity System — Full Bug Fix Edition       ║
+-- ║   Fix: Anti-sky-launch + Velocity Clamp + Fast Enforcer   ║
+-- ╚════════════════════════════════════════════════════════════╝
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+
+local LocalPlayer    = Players.LocalPlayer
+local SNOWBOARD_NAME = "Snowboard"
+local GRAVITY_BOARD  = 59
+local GRAVITY_NORMAL = 196.2
+
+-- ══════════════════════════════════════════════════════════════
+-- ESTADO GLOBAL
+-- ══════════════════════════════════════════════════════════════
+local State = {
+    equipped      = false,
+    target        = GRAVITY_NORMAL,
+    connections   = {},
+    enforcer      = nil,
+    lastPoll      = 0,
+    lastSwitch    = 0,        -- cooldown anti-flicker
+    switching     = false,    -- trava durante transição
+    character     = nil,
+}
+
+local SWITCH_COOLDOWN = 0.3   -- segundos mínimos entre trocas de gravidade
+local ENFORCER_FRAMES = 3     -- checa gravidade a cada 3 frames (~0.05s no RenderStepped)
+
+-- ══════════════════════════════════════════════════════════════
+-- LOGGER
+-- ══════════════════════════════════════════════════════════════
+local function log(msg)
+    print(("[SnowGrav][%s] %s"):format(os.date("%H:%M:%S"), msg))
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- CONEXÕES
+-- ══════════════════════════════════════════════════════════════
+local function addConn(conn)
+    State.connections[#State.connections + 1] = conn
+end
+
+local function clearConns()
+    for i = 1, #State.connections do
+        local c = State.connections[i]
+        if c and typeof(c) == "RBXScriptConnection" and c.Connected then
+            pcall(c.Disconnect, c)
+        end
+    end
+    State.connections = {}
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- CLAMP DE VELOCIDADE VERTICAL
+-- ═══════════════════════════════════════════════════════════════
+-- RAIZ DO BUG: ao baixar a gravidade com velocidade Y acumulada,
+-- o player é lançado para o céu. Zeramos o AssemblyLinearVelocity.Y
+-- ══════════════════════════════════════════════════════════════
+local function clampVerticalVelocity(character)
+    if not character then return end
+    local hrp = character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    pcall(function()
+        local vel = hrp.AssemblyLinearVelocity
+        -- Limita Y: se estiver subindo rápido demais, corta
+        if math.abs(vel.Y) > 5 then
+            hrp.AssemblyLinearVelocity = Vector3.new(vel.X, 0, vel.Z)
+            log("Velocidade vertical cortada: " .. tostring(vel.Y))
+        end
+    end)
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- APLICAÇÃO DE GRAVIDADE — 3 camadas sem BodyForce
+-- ══════════════════════════════════════════════════════════════
+local function applyGravityRaw(value)
+    -- Camada 1: direto
+    local ok = pcall(function() workspace.Gravity = value end)
+
+    -- Camada 2: rawset se falhou ou não aplicou
+    if not ok or workspace.Gravity ~= value then
+        pcall(function() rawset(workspace, "Gravity", value) end)
+    end
+
+    -- Camada 3: defer para garantir no próximo frame
+    if workspace.Gravity ~= value then
+        task.defer(function()
+            pcall(function() workspace.Gravity = value end)
+        end)
+    end
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- TROCA DE GRAVIDADE COM PROTEÇÃO COMPLETA
+-- ══════════════════════════════════════════════════════════════
+local function setGravity(value, reason)
+    local now = tick()
+
+    -- Cooldown: ignora trocas muito rápidas (anti-flicker)
+    if (now - State.lastSwitch) < SWITCH_COOLDOWN then
+        log(("BLOQUEADO por cooldown [%s] → %.2fs restantes"):format(
+            reason or "?",
+            SWITCH_COOLDOWN - (now - State.lastSwitch)
+        ))
+        return
+    end
+
+    -- Evita reaplicar o mesmo valor desnecessariamente
+    if State.target == value and workspace.Gravity == value then return end
+
+    State.lastSwitch = now
+    State.target     = value
+    State.switching  = true
+
+    -- 1. Clamp de velocidade ANTES de mudar gravidade
+    --    Isso previne o bug de voar para o céu
+    clampVerticalVelocity(State.character)
+
+    -- 2. Aplica gravidade
+    applyGravityRaw(value)
+
+    -- 3. Clamp novamente após 1 frame (dupla garantia)
+    task.defer(function()
+        clampVerticalVelocity(State.character)
+        applyGravityRaw(value) -- reforça caso algo tenha revertido no mesmo frame
+        State.switching = false
+    end)
+
+    -- 4. Verificação 0.1s depois para fechar qualquer janela de race condition
+    task.delay(0.1, function()
+        if State.target == value and workspace.Gravity ~= value then
+            log("Correção pós-switch: gravidade reverteu, reaplicando.")
+            applyGravityRaw(value)
+            clampVerticalVelocity(State.character)
+        end
+    end)
+
+    log(("Gravidade → %d [%s]"):format(value, reason or "?"))
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- ENFORCER — RenderStepped é mais rápido que Heartbeat
+-- Detecta e corrige reversão externa da gravidade em ~0.05s
+-- ══════════════════════════════════════════════════════════════
+local function startEnforcer()
+    if State.enforcer and State.enforcer.Connected then
+        State.enforcer:Disconnect()
+    end
+
+    local frame = 0
+    State.enforcer = RunService.RenderStepped:Connect(function()
+        frame = frame + 1
+        if frame < ENFORCER_FRAMES then return end
+        frame = 0
+
+        -- Só corrige se não estiver no meio de uma troca
+        if State.switching then return end
+
+        if workspace.Gravity ~= State.target then
+            log("Enforcer: gravidade revertida externamente! Corrigindo...")
+            applyGravityRaw(State.target)
+        end
+    end)
+
+    log("Enforcer RenderStepped ativo.")
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- EQUIP / UNEQUIP
+-- ══════════════════════════════════════════════════════════════
+local function onEquip()
+    if State.equipped then return end
+    State.equipped = true
+    setGravity(GRAVITY_BOARD, "EQUIP")
+end
+
+local function onUnequip()
+    if not State.equipped then return end
+    State.equipped = false
+    setGravity(GRAVITY_NORMAL, "UNEQUIP")
+end
+
+local function hasSnowboard(character)
+    if not character then return false end
+    for _, v in ipairs(character:GetChildren()) do
+        if v:IsA("Tool") and v.Name == SNOWBOARD_NAME then
+            return true
+        end
+    end
+    return false
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- SETUP DO MONITOR (3 métodos de detecção)
+-- ══════════════════════════════════════════════════════════════
+local function setupMonitor(character)
+    State.character = character
+    clearConns()
+
+    -- Estado inicial
+    task.defer(function()
+        if hasSnowboard(character) then onEquip() else onUnequip() end
+    end)
+
+    -- [Método A] ChildAdded / ChildRemoved no Character
+    addConn(character.ChildAdded:Connect(function(child)
+        if child:IsA("Tool") and child.Name == SNOWBOARD_NAME then
+            onEquip()
+        end
+    end))
+
+    addConn(character.ChildRemoved:Connect(function(child)
+        if child:IsA("Tool") and child.Name == SNOWBOARD_NAME then
+            -- task.defer: 1 frame de espera para confirmar remoção real
+            task.defer(function()
+                if not hasSnowboard(character) then
+                    onUnequip()
+                end
+            end)
+        end
+    end))
+
+    -- [Método B] Backpack monitor
+    local backpack = LocalPlayer:WaitForChild("Backpack", 5)
+    if backpack then
+        addConn(backpack.ChildAdded:Connect(function(child)
+            if child:IsA("Tool") and child.Name == SNOWBOARD_NAME then
+                task.defer(function()
+                    if not hasSnowboard(character) then
+                        onUnequip()
+                    end
+                end)
+            end
+        end))
+    end
+
+    -- [Método C] Polling 1x/segundo — sincronização de segurança
+    addConn(RunService.Heartbeat:Connect(function()
+        local now = tick()
+        if (now - State.lastPoll) < 1 then return end
+        State.lastPoll = now
+
+        local has = hasSnowboard(character)
+        if has and not State.equipped then
+            log("[Poll] Dessincronizado: Equipado mas não marcado.")
+            onEquip()
+        elseif not has and State.equipped then
+            log("[Poll] Dessincronizado: Desequipado mas não marcado.")
+            onUnequip()
+        end
+    end))
+
+    log("Monitor configurado para: " .. character.Name)
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- GIVE SNOWBOARD — 3 tentativas com back-off progressivo
+-- ══════════════════════════════════════════════════════════════
+local function giveSnowboard()
+    local ARGS = { "ToolGiveToServer", LocalPlayer, SNOWBOARD_NAME }
+
+    local function tryFire(attempt)
+        if attempt > 3 then
+            warn("[GiveSnowboard] Falhou após 3 tentativas.")
+            return
+        end
+        local ok, err = pcall(function()
+            local re    = ReplicatedStorage:WaitForChild("RE", 5)
+            local event = re:WaitForChild("1Playe1rTrigge1rEven1t", 5)
+            event:FireServer(table.unpack(ARGS))
+        end)
+        if ok then
+            log(("FireServer OK (tentativa %d)"):format(attempt))
+        else
+            warn(("[GiveSnowboard] Tentativa %d: %s"):format(attempt, tostring(err)))
+            task.delay(attempt * 0.8, function() tryFire(attempt + 1) end)
+        end
+    end
+
+    tryFire(1)
+end
+
+-- ══════════════════════════════════════════════════════════════
+-- INICIALIZAÇÃO
+-- ══════════════════════════════════════════════════════════════
+local function init()
+    log("Inicializando...")
+
+    local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    character:WaitForChild("HumanoidRootPart", 10)
+
+    setupMonitor(character)
+    startEnforcer()
+
+    LocalPlayer.CharacterAdded:Connect(function(newChar)
+        log("Respawn. Reconfigurando...")
+        State.equipped  = false
+        State.target    = GRAVITY_NORMAL
+        State.switching = false
+        newChar:WaitForChild("HumanoidRootPart", 10)
+        setupMonitor(newChar)
+    end)
+
+    task.delay(0.5, giveSnowboard)
+    log("Pronto.")
+end
+
+init()
