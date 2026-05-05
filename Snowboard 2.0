@@ -1,0 +1,781 @@
+-- ╔══════════════════════════════════════════════════════════════════════╗
+-- ║         Snowboard System — Auto-Maneuver + Adaptive AI v4.0         ║
+-- ║  Wall-Ride Automation · Speed Boost · Self-Healing · Pattern Learn  ║
+-- ╚══════════════════════════════════════════════════════════════════════╝
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+
+local LocalPlayer    = Players.LocalPlayer
+local Camera         = workspace.CurrentCamera
+local SNOWBOARD_NAME = "Snowboard"
+local GRAVITY_BOARD  = 48       -- ← atualizado conforme pedido
+local GRAVITY_NORMAL = 196.2
+
+-- ══════════════════════════════════════════════════════════════════════
+-- CONFIGURAÇÕES GLOBAIS
+-- ══════════════════════════════════════════════════════════════════════
+local CFG = {
+    switchCooldown   = 0.25,   -- cooldown mínimo entre trocas de gravidade
+    enforcerFrames   = 3,      -- frames entre cada check do enforcer
+    pollInterval     = 1.0,    -- segundos entre polls de sincronização
+
+    -- Auto-Manobra
+    wallScanDist     = 12,     -- distância de raycast para detectar paredes (studs)
+    wallScanCount    = 8,      -- ângulos de scan ao redor do player
+    wallRideForce    = 28,     -- força horizontal ao realizar a manobra
+    wallRideUpForce  = 12,     -- força vertical ao iniciar wall-ride
+    maneuvCooldown   = 1.8,    -- cooldown entre manobras
+    maneuvDuration   = 0.6,    -- duração de cada manobra
+    minSpeedForWall  = 5,      -- velocidade mínima para tentar wall-ride
+    wallAngleMin     = 50,     -- ângulo mínimo (graus) para considerar parede válida
+}
+
+-- ══════════════════════════════════════════════════════════════════════
+-- ESTADO GLOBAL
+-- ══════════════════════════════════════════════════════════════════════
+local State = {
+    equipped    = false,
+    target      = GRAVITY_NORMAL,
+    connections = {},
+    enforcer    = nil,
+    lastPoll    = 0,
+    lastSwitch  = 0,
+    switching   = false,
+    character   = nil,
+}
+
+-- ══════════════════════════════════════════════════════════════════════
+-- LOGGER
+-- ══════════════════════════════════════════════════════════════════════
+local LOG_PREFIX = "[SnowSys]"
+local function log(tag, msg)
+    print(("%s[%s][%s] %s"):format(LOG_PREFIX, tag, os.date("%H:%M:%S"), msg))
+end
+
+-- ══════════════════════════════════════════════════════════════════════
+-- CONEXÕES
+-- ══════════════════════════════════════════════════════════════════════
+local function addConn(conn)
+    State.connections[#State.connections + 1] = conn
+end
+local function clearConns()
+    for _, c in ipairs(State.connections) do
+        if c and typeof(c) == "RBXScriptConnection" and c.Connected then
+            pcall(c.Disconnect, c)
+        end
+    end
+    State.connections = {}
+end
+
+-- ══════════════════════════════════════════════════════════════════════
+-- GRAVIDADE — 3 CAMADAS
+-- ══════════════════════════════════════════════════════════════════════
+local function applyGravityRaw(value)
+    local ok = pcall(function() workspace.Gravity = value end)
+    if not ok or workspace.Gravity ~= value then
+        pcall(function() rawset(workspace, "Gravity", value) end)
+    end
+    if workspace.Gravity ~= value then
+        task.defer(function() pcall(function() workspace.Gravity = value end) end)
+    end
+end
+
+local function setGravity(value, reason)
+    local now = tick()
+    if (now - State.lastSwitch) < CFG.switchCooldown then return end
+    if State.target == value and math.abs(workspace.Gravity - value) < 0.5 then return end
+    State.lastSwitch = now
+    State.target     = value
+    State.switching  = true
+
+    -- Clamp velocidade vertical antes de trocar
+    local char = State.character
+    if char then
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            pcall(function()
+                local v = hrp.AssemblyLinearVelocity
+                if math.abs(v.Y) > 5 then
+                    hrp.AssemblyLinearVelocity = Vector3.new(v.X, 0, v.Z)
+                end
+            end)
+        end
+    end
+
+    applyGravityRaw(value)
+
+    task.defer(function()
+        if char then
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                pcall(function()
+                    local v = hrp.AssemblyLinearVelocity
+                    if math.abs(v.Y) > 5 then
+                        hrp.AssemblyLinearVelocity = Vector3.new(v.X, 0, v.Z)
+                    end
+                end)
+            end
+        end
+        applyGravityRaw(value)
+        State.switching = false
+    end)
+
+    task.delay(0.1, function()
+        if State.target == value and math.abs(workspace.Gravity - value) > 0.5 then
+            applyGravityRaw(value)
+        end
+    end)
+
+    log("GRAV", ("→ %d [%s]"):format(value, reason or "?"))
+end
+
+-- ══════════════════════════════════════════════════════════════════════
+-- ████████████████  AUTO-MANOBRA (WALL RIDE)  █████████████████████████
+-- Detecta paredes via raycast em 8 direções, executa wall-ride
+-- automático para ganhar velocidade como nas screenshots
+-- ══════════════════════════════════════════════════════════════════════
+local Maneuver = {
+    state        = "IDLE",   -- IDLE | SCANNING | APPROACHING | RIDING | EXITING
+    lastTime     = 0,
+    activeWall   = nil,      -- normal da parede atual
+    wallDir      = nil,      -- direção até a parede
+    rideStart    = 0,
+    speedBefore  = 0,
+    scanConn     = nil,
+
+    -- Estatísticas
+    stats = {
+        total        = 0,
+        wallsFound   = 0,
+        avgGain      = 0,
+        gainHistory  = {},   -- ring buffer de 20 ganhos
+        gainIdx      = 0,
+        bestGain     = 0,
+        lastGain     = 0,
+    },
+}
+
+-- Parâmetros de raycast (ignora o próprio personagem)
+local function makeRaycastParams(character)
+    local p = RaycastParams.new()
+    p.FilterType = Enum.RaycastFilterType.Exclude
+    p.FilterDescendantsInstances = { character }
+    return p
+end
+
+-- Retorna velocidade atual do HRP
+local function getSpeed(hrp)
+    if not hrp then return 0 end
+    local v = nil
+    pcall(function() v = hrp.AssemblyLinearVelocity end)
+    if not v then return 0 end
+    return Vector3.new(v.X, 0, v.Z).Magnitude  -- velocidade horizontal apenas
+end
+
+-- Verifica se a normal é de uma parede válida (ângulo próximo de 90°)
+local function isWall(normal)
+    -- Parede = normal quase horizontal (Y próximo de 0)
+    return math.abs(normal.Y) < math.sin(math.rad(90 - CFG.wallAngleMin))
+end
+
+-- Scan de paredes em CFG.wallScanCount direções ao redor do player
+function Maneuver:scanWalls(character)
+    local hrp = character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+
+    local origin = hrp.Position
+    local params = makeRaycastParams(character)
+    local speed  = getSpeed(hrp)
+
+    if speed < CFG.minSpeedForWall then return nil end
+
+    local best    = nil
+    local bestDot = -math.huge
+
+    -- Usa a direção do look do player como referência
+    local lookDir = hrp.CFrame.LookVector
+    lookDir = Vector3.new(lookDir.X, 0, lookDir.Z).Unit
+
+    for i = 0, CFG.wallScanCount - 1 do
+        local angle  = (i / CFG.wallScanCount) * math.pi * 2
+        local dir    = Vector3.new(math.cos(angle), 0, math.sin(angle))
+
+        local result = workspace:Raycast(origin, dir * CFG.wallScanDist, params)
+        if result and result.Normal and isWall(result.Normal) then
+            -- Prefere paredes à frente/lado do player (não atrás)
+            local dot = lookDir:Dot(dir)
+            if dot > 0.2 and dot > bestDot then
+                bestDot = dot
+                best = {
+                    point    = result.Position,
+                    normal   = result.Normal,
+                    dir      = dir,
+                    dist     = result.Distance,
+                    instance = result.Instance,
+                }
+                self.stats.wallsFound = self.stats.wallsFound + 1
+            end
+        end
+    end
+
+    return best
+end
+
+-- Registra o ganho de velocidade após a manobra
+function Maneuver:recordGain(hrp)
+    local speedAfter = getSpeed(hrp)
+    local gain       = speedAfter - self.speedBefore
+    self.stats.lastGain = gain
+
+    -- Ring buffer de 20
+    self.stats.gainIdx = (self.stats.gainIdx % 20) + 1
+    self.stats.gainHistory[self.stats.gainIdx] = gain
+
+    -- Média
+    local sum, count = 0, 0
+    for _, g in pairs(self.stats.gainHistory) do
+        sum   = sum + g
+        count = count + 1
+    end
+    self.stats.avgGain = count > 0 and (sum / count) or 0
+
+    if gain > self.stats.bestGain then
+        self.stats.bestGain = gain
+    end
+
+    self.stats.total = self.stats.total + 1
+    log("MANUV", ("Manobra #%d | Ganho: +%.1f | Média: +%.1f | Melhor: +%.1f"):format(
+        self.stats.total, gain, self.stats.avgGain, self.stats.bestGain
+    ))
+end
+
+-- Executa a manobra de wall-ride
+function Maneuver:execute(character, wallData)
+    if self.state ~= "IDLE" then return end
+
+    local now = tick()
+    if (now - self.lastTime) < CFG.maneuvCooldown then return end
+
+    local hrp = character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    self.state      = "RIDING"
+    self.lastTime   = now
+    self.rideStart  = now
+    self.activeWall = wallData.normal
+    self.speedBefore = getSpeed(hrp)
+
+    log("MANUV", ("Wall-Ride! Dist: %.1f | Dir: %s"):format(
+        wallData.dist, tostring(wallData.dir)
+    ))
+
+    -- Aplica impulso: horizontal (em direção à parede) + vertical (sobe a parede)
+    pcall(function()
+        local wallDirXZ  = Vector3.new(-wallData.normal.X, 0, -wallData.normal.Z).Unit
+        local currentVel = hrp.AssemblyLinearVelocity
+
+        -- Força horizontal: alinha velocidade com a parede
+        local parallelDir = wallDirXZ - wallDirXZ:Dot(wallData.normal) * wallData.normal
+        parallelDir = parallelDir.Magnitude > 0.01 and parallelDir.Unit or wallDirXZ
+
+        hrp.AssemblyLinearVelocity = Vector3.new(
+            currentVel.X + parallelDir.X * CFG.wallRideForce,
+            CFG.wallRideUpForce,     -- sobe a parede
+            currentVel.Z + parallelDir.Z * CFG.wallRideForce
+        )
+    end)
+
+    -- Estado: RIDING → EXITING após maneuvDuration
+    task.delay(CFG.maneuvDuration, function()
+        if self.state ~= "RIDING" then return end
+        self.state = "EXITING"
+
+        -- Registra ganho e volta ao IDLE
+        pcall(function() self:recordGain(hrp) end)
+
+        task.delay(0.3, function()
+            self.state      = "IDLE"
+            self.activeWall = nil
+        end)
+    end)
+end
+
+-- Loop principal da auto-manobra (roda no Heartbeat)
+local maneuvFrame  = 0
+local maneuvPoll   = 0
+function Maneuver:tick(character)
+    if not State.equipped then return end
+
+    maneuvFrame = maneuvFrame + 1
+    if maneuvFrame < 8 then return end  -- scan a cada ~8 frames
+    maneuvFrame = 0
+
+    if self.state ~= "IDLE" then return end
+
+    local wall = self:scanWalls(character)
+    if wall then
+        self:execute(character, wall)
+    end
+end
+
+-- ══════════════════════════════════════════════════════════════════════
+-- ████████████████████  AI ENGINE v2.0  ███████████████████████████████
+-- Aprendizado adaptativo, diagnóstico profundo, auto-fix inteligente
+-- Novidades: pattern learning, threshold adaptativo, predição de bugs
+-- ══════════════════════════════════════════════════════════════════════
+local AI = {
+
+    -- ─── Memória de bugs ───────────────────────────────────────────────
+    memory = {
+        gravFlips       = 0,
+        skyLaunches     = 0,
+        stateDesyncs    = 0,
+        frozenGravity   = 0,
+        rapidEquips     = 0,
+        totalFixes      = 0,
+        lastBugTime     = 0,
+        lastFixTime     = 0,
+        consecutiveFixes= 0,  -- fixes seguidos sem melhora (detecta loop)
+    },
+
+    -- ─── Thresholds adaptativos ────────────────────────────────────────
+    -- A AI ajusta automaticamente baseado no ambiente detectado
+    thresholds = {
+        maxVelY          = 8,
+        gravTolerance    = 0.5,
+        frozenFrames     = 25,
+        rapidEquipMs     = 200,
+        -- Adaptativos (ajustados pela AI)
+        adaptiveVelLimit = 8,   -- começa em 8, AI pode subir se houver FPs
+        adaptiveMinConf  = 40,  -- confiança mínima para aplicar fixes agressivos
+    },
+
+    -- ─── Counters de frame ────────────────────────────────────────────
+    counters = {
+        wrongGravFrames = 0,
+        highVelFrames   = 0,
+        stableSecs      = 0,
+    },
+
+    -- ─── Padrões aprendidos ───────────────────────────────────────────
+    -- A AI rastreia quais tipos de bug ocorrem juntos (co-ocorrência)
+    patterns = {
+        gravAndVel   = 0,  -- grav flip + vel alta ao mesmo tempo
+        desyncsAfterRespawn = 0,
+        fixLoopCount = 0,  -- quantas vezes o mesmo bug foi fixado 3x seguidas
+    },
+
+    -- ─── Ring buffer de anomalias (20 entradas) ───────────────────────
+    anomalyLog = {},
+    anomalyIdx = 0,
+
+    -- ─── Confiança do sistema (0–100) ─────────────────────────────────
+    confidence  = 100,
+    lastReport  = 0,
+}
+
+-- ─── Logger de anomalia ────────────────────────────────────────────────
+function AI:logAnomaly(aType, detail, severity)
+    local penalty = ({ LOW=1, MEDIUM=4, HIGH=9, CRITICAL=18 })[severity] or 4
+    self.confidence = math.max(0, self.confidence - penalty)
+    self.memory.lastBugTime = tick()
+
+    self.anomalyIdx = (self.anomalyIdx % 20) + 1
+    self.anomalyLog[self.anomalyIdx] = {
+        type=aType, detail=detail, severity=severity,
+        time=tick(), fixed=false,
+    }
+
+    warn(("[AI][%s][%s] %s | %s | Conf: %d%%"):format(
+        os.date("%H:%M:%S"), severity, aType, detail or "", self.confidence
+    ))
+end
+
+-- ─── Logger de fix ────────────────────────────────────────────────────
+function AI:logFix(fType)
+    self.memory.totalFixes = self.memory.totalFixes + 1
+    self.memory.lastFixTime = tick()
+    self.memory.consecutiveFixes = self.memory.consecutiveFixes + 1
+    self.confidence = math.min(100, self.confidence + 1.5)
+
+    if self.anomalyLog[self.anomalyIdx] then
+        self.anomalyLog[self.anomalyIdx].fixed = true
+    end
+
+    -- Detecta loop de fix (mesmo bug fixado 5x+ sem parar = ajusta threshold)
+    if self.memory.consecutiveFixes >= 5 then
+        self:adaptThresholds()
+        self.memory.consecutiveFixes = 0
+    end
+
+    log("AI:FIX", ("%s | Fix#%d | Conf:%d%%"):format(
+        fType, self.memory.totalFixes, self.confidence
+    ))
+end
+
+-- ─── Thresholds Adaptativos ────────────────────────────────────────────
+-- Se a AI ficar fixando o mesmo problema em loop, ela ajusta os limites
+function AI:adaptThresholds()
+    -- Se muitos sky-launches → reduz maxVelY para ser mais agressivo
+    if self.memory.skyLaunches > 10 then
+        self.thresholds.adaptiveVelLimit = math.max(4, self.thresholds.adaptiveVelLimit - 1)
+        log("AI:ADAPT", "maxVelY reduzido → " .. self.thresholds.adaptiveVelLimit)
+    end
+
+    -- Se muitos gravFlips → reduz frozenFrames para detectar mais rápido
+    if self.memory.gravFlips > 15 then
+        self.thresholds.frozenFrames = math.max(10, self.thresholds.frozenFrames - 3)
+        log("AI:ADAPT", "frozenFrames reduzido → " .. self.thresholds.frozenFrames)
+    end
+
+    -- Confiança muito baixa → se torna mais conservador (menos fixes agressivos)
+    if self.confidence < self.thresholds.adaptiveMinConf then
+        log("AI:ADAPT", "Confiança baixa. Modo conservador ativado.")
+    end
+end
+
+-- ─── Diagnóstico 1: Gravidade ──────────────────────────────────────────
+function AI:diagnoseGravity()
+    local diff = math.abs(workspace.Gravity - State.target)
+
+    if diff > self.thresholds.gravTolerance then
+        self.counters.wrongGravFrames = self.counters.wrongGravFrames + 1
+        self.memory.gravFlips = self.memory.gravFlips + 1
+
+        if self.counters.wrongGravFrames >= self.thresholds.frozenFrames then
+            self:logAnomaly("GRAVITY_FROZEN",
+                ("Preso em %.1f | esperado %.1f | %d frames"):format(
+                    workspace.Gravity, State.target, self.counters.wrongGravFrames
+                ), "CRITICAL")
+            self.memory.frozenGravity = self.memory.frozenGravity + 1
+            return "FROZEN"
+        elseif self.counters.wrongGravFrames >= 6 then
+            self:logAnomaly("GRAVITY_FLIP",
+                ("%.1f → %.1f"):format(workspace.Gravity, State.target), "HIGH")
+            return "FLIP"
+        end
+        return "DRIFT"
+    end
+
+    self.counters.wrongGravFrames = 0
+    self.counters.stableSecs = self.counters.stableSecs + 1
+
+    -- Recuperação lenta de confiança em ambiente estável
+    if self.counters.stableSecs > 180 then  -- ~3s de frames estáveis
+        self.confidence = math.min(100, self.confidence + 0.1)
+        self.counters.stableSecs = 0
+    end
+    return "OK"
+end
+
+-- ─── Diagnóstico 2: Velocidade Vertical (Anti-Sky-Launch) ──────────────
+function AI:diagnoseVelocity(character)
+    if not character then return "NO_CHAR" end
+    local hrp = character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return "NO_HRP" end
+
+    local vel = nil
+    pcall(function() vel = hrp.AssemblyLinearVelocity end)
+    if not vel then return "NO_VEL" end
+
+    -- Ignora velocidade Y alta durante wall-ride intencional
+    if Maneuver.state == "RIDING" then return "OK_MANEUV", hrp, vel end
+
+    local absY = math.abs(vel.Y)
+    local limit = self.thresholds.adaptiveVelLimit
+
+    if vel.Y > limit then
+        self.counters.highVelFrames = self.counters.highVelFrames + 1
+
+        if self.counters.highVelFrames >= 3 then
+            local sev = vel.Y > 60 and "CRITICAL" or vel.Y > 25 and "HIGH" or "MEDIUM"
+            self:logAnomaly("SKY_LAUNCH",
+                ("Y=%.1f | max=%d | frames=%d"):format(vel.Y, limit, self.counters.highVelFrames),
+                sev)
+            self.memory.skyLaunches = self.memory.skyLaunches + 1
+            return "LAUNCH", hrp, vel
+        end
+        return "RISING", hrp, vel
+    end
+
+    self.counters.highVelFrames = 0
+    return "OK", hrp, vel
+end
+
+-- ─── Diagnóstico 3: Estado ─────────────────────────────────────────────
+function AI:diagnoseState(character)
+    if not character then return "NO_CHAR" end
+
+    local hasBoard = false
+    for _, v in ipairs(character:GetChildren()) do
+        if v:IsA("Tool") and v.Name == SNOWBOARD_NAME then hasBoard = true break end
+    end
+
+    if hasBoard ~= State.equipped then
+        self.memory.stateDesyncs = self.memory.stateDesyncs + 1
+        if hasBoard then
+            self:logAnomaly("DESYNC_EQUIP", "No char mas State=false", "HIGH")
+            return "DESYNC_EQUIP"
+        else
+            self:logAnomaly("DESYNC_UNEQUIP", "Fora do char mas State=true", "HIGH")
+            return "DESYNC_UNEQUIP"
+        end
+    end
+    return "OK"
+end
+
+-- ─── Diagnóstico 4: Padrões Co-ocorrentes ─────────────────────────────
+function AI:diagnosePatterns(gravStatus, velStatus)
+    -- Bug composto: grav flip + sky launch ao mesmo tempo = mais grave
+    if gravStatus ~= "OK" and (velStatus == "LAUNCH" or velStatus == "RISING") then
+        self.patterns.gravAndVel = self.patterns.gravAndVel + 1
+        if self.patterns.gravAndVel % 3 == 0 then
+            self:logAnomaly("PATTERN_COMPOUND",
+                ("Grav+Vel simultâneos ×%d"):format(self.patterns.gravAndVel),
+                "CRITICAL")
+            return "COMPOUND"
+        end
+    end
+    return "OK"
+end
+
+-- ─── Auto-Fix ─────────────────────────────────────────────────────────
+function AI:autoFix(gravStatus, velStatus, stateStatus, hrp, vel)
+
+    -- Fix 1: Gravidade errada
+    if gravStatus ~= "OK" then
+        applyGravityRaw(State.target)
+        task.defer(function() applyGravityRaw(State.target) end)
+        self:logFix("GRAV_RESTORE[" .. gravStatus .. "]")
+        self.memory.consecutiveFixes = 0  -- reset em bug de grav (diferente)
+    end
+
+    -- Fix 2: Sky-Launch
+    if velStatus == "LAUNCH" or velStatus == "RISING" then
+        pcall(function()
+            local v = hrp.AssemblyLinearVelocity
+            hrp.AssemblyLinearVelocity = Vector3.new(v.X, 0, v.Z)
+        end)
+
+        if velStatus == "LAUNCH" then
+            applyGravityRaw(State.target)
+            task.defer(function()
+                pcall(function()
+                    local v2 = hrp.AssemblyLinearVelocity
+                    if v2.Y > 5 then
+                        hrp.AssemblyLinearVelocity = Vector3.new(v2.X, -2, v2.Z)
+                    end
+                end)
+            end)
+            self:logFix("SKY_LAUNCH_HARD")
+        else
+            self:logFix("SKY_LAUNCH_EARLY")
+        end
+    end
+
+    -- Fix 3: Desync de estado
+    if stateStatus == "DESYNC_EQUIP" then
+        State.equipped = true
+        State.target   = GRAVITY_BOARD
+        applyGravityRaw(GRAVITY_BOARD)
+        self:logFix("RESYNC_EQUIP")
+    elseif stateStatus == "DESYNC_UNEQUIP" then
+        State.equipped = false
+        State.target   = GRAVITY_NORMAL
+        applyGravityRaw(GRAVITY_NORMAL)
+        self:logFix("RESYNC_UNEQUIP")
+    end
+end
+
+-- ─── Relatório periódico (a cada 30s) ─────────────────────────────────
+function AI:report()
+    local now = tick()
+    if (now - self.lastReport) < 30 then return end
+    self.lastReport = now
+
+    local m = self.memory
+    local s = Maneuver.stats
+    print("╔══ [AI REPORT " .. os.date("%H:%M:%S") .. "] ════════════════════════")
+    print(("║  Confiança:     %d%%"):format(self.confidence))
+    print(("║  Grav Flips:    %d  |  Frozen: %d"):format(m.gravFlips, m.frozenGravity))
+    print(("║  Sky Launches:  %d"):format(m.skyLaunches))
+    print(("║  Desyncs:       %d  |  Fixes: %d"):format(m.stateDesyncs, m.totalFixes))
+    print(("║  [MANOBRAS]  Total: %d | Paredes: %d"):format(s.total, s.wallsFound))
+    print(("║  Ganho Médio:   +%.1f | Melhor: +%.1f | Último: +%.1f"):format(
+        s.avgGain, s.bestGain, s.lastGain))
+    print(("║  VelLimit adaptativo: %d | FrozenFrames: %d"):format(
+        self.thresholds.adaptiveVelLimit, self.thresholds.frozenFrames))
+    print("╚════════════════════════════════════════════════════")
+end
+
+-- ─── Loop principal da AI (RenderStepped) ─────────────────────────────
+function AI:startLoop()
+    if self.loop and self.loop.Connected then self.loop:Disconnect() end
+
+    local frame = 0
+    self.loop = RunService.RenderStepped:Connect(function()
+        frame = frame + 1
+        if frame < CFG.enforcerFrames then return end
+        frame = 0
+
+        local char = State.character
+        if not char then return end
+
+        -- Diagnósticos
+        local gravStatus              = self:diagnoseGravity()
+        local velStatus, hrp, vel     = self:diagnoseVelocity(char)
+        local stateStatus             = self:diagnoseState(char)
+        self:diagnosePatterns(gravStatus, velStatus)
+
+        -- Enforcer: corrige gravidade revertida (mesmo sem bug grave)
+        if not State.switching and math.abs(workspace.Gravity - State.target) > CFG.gravTolerance then
+            applyGravityRaw(State.target)
+        end
+
+        -- Auto-fix se necessário
+        local needsFix = gravStatus ~= "OK"
+                      or velStatus == "LAUNCH" or velStatus == "RISING"
+                      or stateStatus ~= "OK"
+        if needsFix then
+            self:autoFix(gravStatus, velStatus, stateStatus, hrp, vel)
+        else
+            self.memory.consecutiveFixes = 0
+        end
+
+        -- Auto-Manobra
+        Maneuver:tick(char)
+
+        -- Relatório
+        self:report()
+    end)
+
+    log("AI", "Loop RenderStepped ativo.")
+end
+
+-- ══════════════════════════════════════════════════════════════════════
+-- EQUIP / UNEQUIP
+-- ══════════════════════════════════════════════════════════════════════
+local function onEquip()
+    if State.equipped then return end
+    State.equipped = true
+    setGravity(GRAVITY_BOARD, "EQUIP")
+end
+
+local function onUnequip()
+    if not State.equipped then return end
+    State.equipped = false
+    Maneuver.state = "IDLE"   -- cancela manobra ao desequipar
+    setGravity(GRAVITY_NORMAL, "UNEQUIP")
+end
+
+local function hasSnowboard(character)
+    if not character then return false end
+    for _, v in ipairs(character:GetChildren()) do
+        if v:IsA("Tool") and v.Name == SNOWBOARD_NAME then return true end
+    end
+    return false
+end
+
+-- ══════════════════════════════════════════════════════════════════════
+-- MONITOR DO PERSONAGEM (3 métodos)
+-- ══════════════════════════════════════════════════════════════════════
+local function setupMonitor(character)
+    State.character = character
+    clearConns()
+
+    task.defer(function()
+        if hasSnowboard(character) then onEquip() else onUnequip() end
+    end)
+
+    -- Método A: ChildAdded / ChildRemoved
+    addConn(character.ChildAdded:Connect(function(child)
+        if child:IsA("Tool") and child.Name == SNOWBOARD_NAME then onEquip() end
+    end))
+    addConn(character.ChildRemoved:Connect(function(child)
+        if child:IsA("Tool") and child.Name == SNOWBOARD_NAME then
+            task.defer(function()
+                if not hasSnowboard(character) then onUnequip() end
+            end)
+        end
+    end))
+
+    -- Método B: Backpack
+    local backpack = LocalPlayer:WaitForChild("Backpack", 5)
+    if backpack then
+        addConn(backpack.ChildAdded:Connect(function(child)
+            if child:IsA("Tool") and child.Name == SNOWBOARD_NAME then
+                task.defer(function()
+                    if not hasSnowboard(character) then onUnequip() end
+                end)
+            end
+        end))
+    end
+
+    -- Método C: Poll 1s
+    addConn(RunService.Heartbeat:Connect(function()
+        local now = tick()
+        if (now - State.lastPoll) < CFG.pollInterval then return end
+        State.lastPoll = now
+        local has = hasSnowboard(character)
+        if has and not State.equipped then onEquip()
+        elseif not has and State.equipped then onUnequip() end
+    end))
+
+    log("MON", "Monitor ativo.")
+end
+
+-- ══════════════════════════════════════════════════════════════════════
+-- GIVE SNOWBOARD
+-- ══════════════════════════════════════════════════════════════════════
+local function giveSnowboard()
+    local ARGS = { "ToolGiveToServer", LocalPlayer, SNOWBOARD_NAME }
+    local function tryFire(attempt)
+        if attempt > 3 then warn("[Give] Falhou após 3 tentativas.") return end
+        local ok, err = pcall(function()
+            local re    = ReplicatedStorage:WaitForChild("RE", 5)
+            local event = re:WaitForChild("1Playe1rTrigge1rEven1t", 5)
+            event:FireServer(table.unpack(ARGS))
+        end)
+        if ok then log("GIVE", ("OK tentativa %d"):format(attempt))
+        else
+            warn(("[Give] Tentativa %d: %s"):format(attempt, tostring(err)))
+            task.delay(attempt * 0.8, function() tryFire(attempt + 1) end)
+        end
+    end
+    tryFire(1)
+end
+
+-- ══════════════════════════════════════════════════════════════════════
+-- INICIALIZAÇÃO
+-- ══════════════════════════════════════════════════════════════════════
+local function init()
+    log("SYS", "Inicializando v4.0...")
+
+    local character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+    character:WaitForChild("HumanoidRootPart", 10)
+
+    setupMonitor(character)
+    AI:startLoop()
+
+    LocalPlayer.CharacterAdded:Connect(function(newChar)
+        log("SYS", "Respawn detectado.")
+        State.equipped            = false
+        State.target              = GRAVITY_NORMAL
+        State.switching           = false
+        Maneuver.state            = "IDLE"
+        AI.counters.wrongGravFrames = 0
+        AI.counters.highVelFrames   = 0
+        AI.memory.consecutiveFixes  = 0
+        AI.patterns.desyncsAfterRespawn = AI.patterns.desyncsAfterRespawn + 1
+        newChar:WaitForChild("HumanoidRootPart", 10)
+        setupMonitor(newChar)
+    end)
+
+    task.delay(0.5, giveSnowboard)
+    log("SYS", "Sistema pronto. Gravidade alvo: " .. GRAVITY_BOARD)
+end
+
+init()
